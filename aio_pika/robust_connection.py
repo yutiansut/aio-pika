@@ -1,14 +1,13 @@
 import asyncio
 from functools import wraps
 from logging import getLogger
-from typing import Callable
+from typing import Callable, Type
 
-from aio_pika.pika.channel import Channel as PikaChannel
-from .pika.exceptions import ChannelClosed
-
-from .adapter import AsyncioConnection
-from .exceptions import ProbableAuthenticationError
-from .connection import Connection, connect
+from aiormq.connection import parse_bool, parse_int
+from .exceptions import CONNECTION_EXCEPTIONS
+from .connection import Connection, connect, ConnectionType
+from .tools import CallbackCollection
+from .types import TimeoutType
 from .robust_channel import RobustChannel
 
 
@@ -28,33 +27,46 @@ def _ensure_connection(func):
 class RobustConnection(Connection):
     """ Robust connection """
 
-    DEFAULT_RECONNECT_INTERVAL = 1
     CHANNEL_CLASS = RobustChannel
+    KWARGS_TYPES = (
+        ('reconnect_interval', parse_int, '5'),
+        ('fail_fast', parse_bool, '1'),
+    )
 
-    def __init__(self, host: str = 'localhost', port: int=5672,
-                 login: str = 'guest', password: str = 'guest',
-                 virtual_host: str = '/', ssl: bool=False, *,
-                 loop=None, **kwargs):
+    def __init__(self, url, loop=None, **kwargs):
+        super().__init__(
+            loop=loop or asyncio.get_event_loop(), url=url, **kwargs
+        )
 
-        self.reconnect_interval = kwargs.pop('reconnect_interval',
-                                             self.DEFAULT_RECONNECT_INTERVAL)
+        self.reconnect_interval = self.kwargs['reconnect_interval']
+        self.fail_fast = self.kwargs['fail_fast']
 
-        super().__init__(host=host, port=port, login=login,
-                         password=password, virtual_host=virtual_host,
-                         ssl=ssl, loop=loop, **kwargs)
-
+        self.__channels = set()
+        self._on_reconnect_callbacks = CallbackCollection()
         self._closed = False
-        self._on_connection_lost_callbacks = []
-        self._on_reconnect_callbacks = []
-        self._on_close_callbacks = []
 
-    def add_connection_lost_callback(self, callback: Callable[[], None]):
-        """ Add callback which will be called after connection was lost.
+    @property
+    def on_reconnect_callbacks(self) -> CallbackCollection:
+        return self._on_reconnect_callbacks
 
-        :return: None
-        """
+    @property
+    def _channels(self) -> dict:
+        return {ch.number: ch for ch in self.__channels}
 
-        self._on_connection_lost_callbacks.append(lambda c: callback(c))
+    def _on_connection_close(self, connection, closing, *args, **kwargs):
+        self.connection = None
+
+        # Have to remove non initialized channels
+        self.__channels = {
+            ch for ch in self.__channels if ch.number is not None
+        }
+
+        super()._on_connection_close(connection, closing)
+
+        self.loop.call_later(
+            self.reconnect_interval,
+            lambda: self.loop.create_task(self.reconnect())
+        )
 
     def add_reconnect_callback(self, callback: Callable[[], None]):
         """ Add callback which will be called after reconnect.
@@ -62,96 +74,89 @@ class RobustConnection(Connection):
         :return: None
         """
 
-        self._on_reconnect_callbacks.append(lambda c: callback(c))
+        self._on_reconnect_callbacks.add(callback)
 
-    def add_close_callback(self, callback: Callable[[], None]):
-        """ Add callback which will be called after connection will be closed.
+    async def connect(self, timeout: TimeoutType = None):
+        while True:
+            try:
+                return await super().connect(timeout=timeout)
+            except CONNECTION_EXCEPTIONS:
+                if self.fail_fast:
+                    raise
 
-        :return: None
-        """
+                log.warning(
+                    "First connection attempt failed "
+                    "and will be retried after %d seconds",
+                    self.reconnect_interval,
+                    exc_info=True,
+                )
 
-        self._on_close_callbacks.append(lambda c: callback(c))
+                await asyncio.sleep(self.reconnect_interval)
 
-    def _on_connection_lost(self, future: asyncio.Future,
-                            connection: AsyncioConnection, code, reason):
-        for callback in self._on_connection_lost_callbacks:
-            callback(self)
+    async def reconnect(self):
+        if self.is_closed:
+            return
 
-        if self._closed:
-            return super()._on_connection_lost(future, connection, code, reason)
+        try:
+            await super().connect()
+        except CONNECTION_EXCEPTIONS:
+            log.exception('Connection attempt error')
 
-        if isinstance(reason, ProbableAuthenticationError):
-            log.error("Authentication error: %d - %s", code, reason)
+            self.loop.call_later(
+                self.reconnect_interval,
+                lambda: self.loop.create_task(self.reconnect())
+            )
+        else:
+            await self._on_reconnect()
 
-        if isinstance(reason, ConnectionRefusedError):
-            log.error("Connection refused: %d - %s", code, reason)
+    def channel(self, channel_number: int = None,
+                publisher_confirms: bool = True,
+                on_return_raises=False):
 
-        if not future.done():
-            future.set_result(None)
-
-        self.loop.call_later(
-            self.reconnect_interval,
-            lambda: self.loop.create_task(self.connect())
+        channel = super().channel(
+            channel_number=channel_number,
+            publisher_confirms=publisher_confirms,
+            on_return_raises=on_return_raises,
         )
 
-    def _channel_cleanup(self, channel: PikaChannel):
-        ch = self._channels[channel.channel_number]     # type: RobustChannel
-        ch._futures.reject_all(ChannelClosed)
+        self.__channels.add(channel)
 
-        if ch._closed:
-            self._channels.pop(channel.channel_number)  # type: RobustChannel
+        return channel
 
-    def _on_channel_error(self, channel: PikaChannel):
-        log.error("Channel closed: %s. Will attempt to reconnect", channel)
-        channel.connection.close(reply_code=500, reply_text="Channel canceled")
-
-    def _on_channel_cancel(self, channel: PikaChannel):
-        log.debug("Channel canceled: %s", channel)
-        self._on_channel_error(channel)
-
-    async def connect(self):
-        result = await super().connect()
-
-        while self._connection is None:
-            await asyncio.sleep(self.reconnect_interval, loop=self.loop)
-            result = await super().connect()
-
-        for number, channel in tuple(self._channels.items()):
+    async def _on_reconnect(self):
+        for number, channel in self._channels.items():
             try:
                 await channel.on_reconnect(self, number)
-            except ChannelClosed:
-                self._on_channel_error(channel._channel)
+            except CONNECTION_EXCEPTIONS:
+                log.exception('Open channel failure')
+                await self.close()
                 return
 
-        for callback in self._on_reconnect_callbacks:
-            callback(self)
-
-        return result
+        self._on_reconnect_callbacks(self)
 
     @property
     def is_closed(self):
         """ Is this connection is closed """
-
         return self._closed or super().is_closed
 
-    def close(self) -> asyncio.Task:
-        """ Close AMQP connection """
-        try:
-            for callback in self._on_close_callbacks:
-                callback(self)
-        finally:
-            task = super().close()
-            self._closed = True
-            return task
+    async def close(self, exc=asyncio.CancelledError):
+        if self.is_closed:
+            return
+
+        self._closed = True
+
+        if self.connection is None:
+            return
+        return await super().close(exc)
 
 
-async def connect_robust(url: str=None, *, host: str='localhost',
-                         port: int=5672, login: str='guest',
-                         password: str='guest', virtualhost: str='/',
-                         ssl: bool=False, loop=None,
-                         ssl_options: dict=None,
-                         connection_class=RobustConnection,
-                         **kwargs) -> Connection:
+async def connect_robust(
+    url: str = None, *, host: str = 'localhost', port: int = 5672,
+    login: str = 'guest', password: str = 'guest', virtualhost: str = '/',
+    ssl: bool = False, loop: asyncio.AbstractEventLoop = None,
+    ssl_options: dict = None, timeout: TimeoutType = None,
+    connection_class: Type[ConnectionType] = RobustConnection, **kwargs
+) -> ConnectionType:
 
     """ Make robust connection to the broker.
 
@@ -198,24 +203,19 @@ async def connect_robust(url: str=None, *, host: str='localhost',
         will be used keyword arguments.
     :param host: hostname of the broker
     :param port: broker port 5672 by default
-    :param login:
-        username string. `'guest'` by default. Provide empty string
-        for pika.credentials.ExternalCredentials usage.
+    :param login: username string. `'guest'` by default.
     :param password: password string. `'guest'` by default.
     :param virtualhost: virtualhost parameter. `'/'` by default
-    :param ssl:
-        use SSL for connection. Should be used with addition kwargs.
-        See `pika documentation`_ for more info.
+    :param ssl: use SSL for connection. Should be used with addition kwargs.
     :param ssl_options: A dict of values for the SSL connection.
+    :param timeout: connection timeout in seconds
     :param loop:
         Event loop (:func:`asyncio.get_event_loop()` when :class:`None`)
     :param connection_class: Factory of a new connection
-    :param kwargs:
-        addition parameters which will be passed to the pika connection.
+    :param kwargs: addition parameters which will be passed to the connection.
     :return: :class:`aio_pika.connection.Connection`
 
     .. _RFC3986: https://goo.gl/MzgYAs
-    .. _pika documentation: https://goo.gl/TdVuZ9
     .. _official Python documentation: https://goo.gl/pty9xA
 
     """
@@ -224,7 +224,7 @@ async def connect_robust(url: str=None, *, host: str='localhost',
             url=url, host=host, port=port, login=login,
             password=password, virtualhost=virtualhost, ssl=ssl,
             loop=loop, connection_class=connection_class,
-            ssl_options=ssl_options, **kwargs
+            ssl_options=ssl_options, timeout=timeout, **kwargs
         )
     )
 

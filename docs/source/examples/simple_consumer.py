@@ -18,12 +18,13 @@ async def main(loop):
             queue_name, auto_delete=True
         )
 
-        async for message in queue:
-            with message.process():
-                print(message.body)
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    print(message.body)
 
-                if queue.name in message.body.decode():
-                    break
+                    if queue.name in message.body.decode():
+                        break
 
 
 if __name__ == "__main__":

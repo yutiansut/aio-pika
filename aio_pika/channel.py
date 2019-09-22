@@ -1,40 +1,41 @@
 import asyncio
-from typing import Callable, Any, Union, Awaitable
-
+from enum import unique, Enum
 from logging import getLogger
-from types import FunctionType
 
-from aio_pika.pika.spec import BasicProperties, Channel as PikaChannel
-from . import exceptions
-from .common import BaseChannel, FutureStore, ConfirmationTypes
+from aio_pika.tools import CallbackCollection
+
+try:  # pragma: no cover
+    from typing import Awaitable, Union  # noqa
+except ImportError:
+    from typing_extensions import Awaitable  # noqa
+
+import aiormq
+import aiormq.types
+
 from .exchange import Exchange, ExchangeType
-from .message import IncomingMessage, ReturnedMessage
+from .message import IncomingMessage
 from .queue import Queue
 from .transaction import Transaction
-
+from .types import ReturnCallbackType, CloseCallbackType, TimeoutType
 
 log = getLogger(__name__)
 
-FunctionOrCoroutine = Union[
-    Callable[[IncomingMessage], Any],
-    Awaitable[IncomingMessage]
-]
+
+@unique
+class ConfirmationTypes(Enum):
+    ACK = 'ack'
+    NACK = 'nack'
 
 
-class Channel(BaseChannel):
+class Channel:
     """ Channel abstraction """
 
     QUEUE_CLASS = Queue
     EXCHANGE_CLASS = Exchange
 
-    __slots__ = ('_connection', '__closing', '_confirmations', '_delivery_tag',
-                 'loop', '_futures', '_channel', '_on_return_callbacks',
-                 'default_exchange', '_write_lock', '_channel_number',
-                 '_publisher_confirms', '_on_return_raises')
-
-    def __init__(self, connection, loop: asyncio.AbstractEventLoop,
-                 future_store: FutureStore, channel_number: int=None,
-                 publisher_confirms: bool=True, on_return_raises=False):
+    def __init__(self, connection, channel_number: int = None,
+                 publisher_confirms: bool = True,
+                 on_return_raises: bool = False):
         """
 
         :param connection: :class:`aio_pika.adapter.AsyncioConnection` instance
@@ -44,54 +45,80 @@ class Channel(BaseChannel):
         :param publisher_confirms: False if you don't need delivery
                 confirmations (in pursuit of performance)
         """
-        super().__init__(loop, future_store.get_child())
-
-        self._channel = None  # type: pika.channel.Channel
-        self._connection = connection
-        self._confirmations = {}
-        self._on_return_callbacks = []
-        self._delivery_tag = 0
-        self._write_lock = asyncio.Lock(loop=self.loop)
-        self._channel_number = channel_number
-        self._publisher_confirms = publisher_confirms
 
         if not publisher_confirms and on_return_raises:
             raise RuntimeError(
-                'on_return_raises must be uses with publisher confirms'
+                '"on_return_raises" not applicable without "publisher_confirms"'
             )
 
-        self._on_return_raises = on_return_raises
+        self.loop = connection.loop
 
-        self.default_exchange = self.EXCHANGE_CLASS(
-            self._channel,
-            self._publish,
-            '',
-            ExchangeType.DIRECT,
-            durable=None,
-            auto_delete=None,
-            internal=None,
-            passive=None,
-            arguments=None,
-            loop=self.loop,
-            future_store=self._futures.get_child(),
-        )
+        self._connection = connection
+        self._done_callbacks = CallbackCollection()
+        self._return_callbacks = CallbackCollection()
+        self._channel = None  # type: aiormq.Channel
+        self._channel_number = channel_number
+        self._on_return_raises = on_return_raises
+        self._publisher_confirms = publisher_confirms
+
+        self._delivery_tag = 0
+
+        # noinspection PyTypeChecker
+        self.default_exchange = None       # type: Exchange
 
     @property
-    def _channel_maker(self):
-        return self._connection._connection.channel
+    def done_callbacks(self) -> CallbackCollection:
+        return self._done_callbacks
+
+    @property
+    def return_callbacks(self) -> CallbackCollection:
+        return self._return_callbacks
+
+    @property
+    def is_closed(self):
+        if not self._channel:
+            return True
+        return self.channel.is_closed
+
+    async def close(self, exc=None):
+        if not self._channel:
+            log.warning("Channel already closed")
+            return
+
+        if self.channel.is_closed:
+            return
+
+        # noinspection PyTypeChecker
+        channel = self._channel     # type: aiormq.Channel
+        self._channel = ()
+        await channel.close()
+
+        self._done_callbacks(exc)
+
+    @property
+    def channel(self) -> aiormq.Channel:
+        if self._channel is None:
+            raise RuntimeError("Channel was not opened")
+
+        return self._channel
 
     @property
     def number(self):
-        return self._channel.channel_number
+        return self.channel.number if self._channel else None
 
     def __str__(self):
         return "{0}".format(
-            self.number if self._channel else "Not initialized channel"
+            self.number or "Not initialized channel"
         )
 
     def __repr__(self):
+        conn = None
+
+        if self._channel:
+            conn = self._channel.connection
+
         return '<%s "%s#%s">' % (
-            self.__class__.__name__, self._connection, self
+            self.__class__.__name__, conn, self
         )
 
     def __iter__(self):
@@ -110,181 +137,99 @@ class Channel(BaseChannel):
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    def _on_channel_close(self, channel: PikaChannel, code: int, reason):
-        # In case of normal closing, closing code should be unaltered
-        # (0 by default)
-        # See: https://github.com/pika/pika/blob/8d970e1/pika/channel.py#L84
-        exc = exceptions.ChannelClosed(code, reason)
+    def add_close_callback(self, callback: CloseCallbackType) -> None:
+        self._done_callbacks.add(callback)
 
-        if code == 0:
-            self._closing.set_result(None)
-            log_method = log.debug
-        else:
-            self._closing.set_exception(exc)
-            log_method = log.error
+    def remove_close_callback(self, callback: CloseCallbackType) -> None:
+        self._done_callbacks.remove(callback)
 
-        log_method("Channel %r closed: %d - %s", channel, code, reason)
+    def add_on_return_callback(self, callback: ReturnCallbackType) -> None:
+        self._return_callbacks.add(callback)
 
-        self._futures.reject_all(exc)
-        return exc
+    def remove_on_return_callback(self, callback: ReturnCallbackType) -> None:
+        self._return_callbacks.remove(callback)
 
-    def _on_return(self, channel, message, properties, body):
-        msg = ReturnedMessage(
-            body=body,
-            channel=channel,
-            envelope=message,
-            properties=properties,
+    async def _create_channel(self) -> aiormq.Channel:
+        await self._connection.ready()
+
+        return await self._connection.connection.channel(
+            publisher_confirms=self._publisher_confirms,
+            on_return_raises=self._on_return_raises,
+            channel_number=self._channel_number,
         )
 
-        for callback in self._on_return_callbacks:
-            self.loop.create_task(callback(msg))
+    async def initialize(self, timeout: TimeoutType = None) -> None:
+        if self._channel is not None:
+            raise RuntimeError("Can't initialize channel")
 
-    def add_close_callback(self, callback: FunctionType) -> None:
-        self._closing.add_done_callback(lambda r: callback(r))
-
-    def remove_close_callback(self, callback: FunctionType) -> None:
-        self._closing.remove_done_callback(callback)
-
-    @property
-    async def closing(self):
-        """ Return future which will be finished after channel close. """
-        return await self._closing
-
-    def add_on_return_callback(self, callback: FunctionOrCoroutine) -> None:
-        self._on_return_callbacks.append(asyncio.coroutine(callback))
-
-    async def _create_channel(self, timeout=None):
-        future = self._create_future(timeout=timeout)
-
-        self._channel_maker(
-            future.set_result,
-            channel_number=self._channel_number
+        self._channel = await asyncio.wait_for(
+            self._create_channel(), timeout=timeout
         )
 
-        channel = await future  # type: pika.channel.Channel
+        self._delivery_tag = 0
 
-        if self._publisher_confirms:
-            channel.confirm_delivery(self._on_delivery_confirmation)
-
-            if self._on_return_raises:
-                channel.add_on_return_callback(self._on_return_delivery)
-
-        channel.add_on_close_callback(self._on_channel_close)
-        channel.add_on_return_callback(self._on_return)
-
-        return channel
-
-    async def initialize(self, timeout=None) -> None:
-        async with self._write_lock:
-            if self._closing.done():
-                raise RuntimeError("Can't initialize closed channel")
-
-            self._channel = await self._create_channel(timeout)
-            self._connection._on_channel_open(self)
-            self._delivery_tag = 0
-
-    def _on_return_delivery(self, channel, method_frame, properties, body):
-        f = self._confirmations.pop(int(properties.headers.get('delivery-tag')))
-        f.set_exception(exceptions.UnroutableError([body]))
-
-    def _on_delivery_confirmation(self, method_frame):
-        future = self._confirmations.pop(
-            method_frame.method.delivery_tag, None
+        self.default_exchange = self.EXCHANGE_CLASS(
+            connection=self._connection,
+            channel=self.channel,
+            arguments=None,
+            auto_delete=None,
+            durable=None,
+            internal=None,
+            name='',
+            passive=None,
+            type=ExchangeType.DIRECT,
         )
 
-        if not future:
-            log.info(
-                "Unknown delivery tag %d for message confirmation \"%s\"",
-                method_frame.method.delivery_tag, method_frame.method.NAME
-            )
-            return
+        self.channel.on_return_callbacks.add(self._on_return)
 
-        try:
-            confirmation_type = ConfirmationTypes(
-                method_frame.method.NAME.split('.')[1].lower()
-            )
+    def _on_return(self, message: aiormq.types.DeliveredMessage):
+        self._return_callbacks(IncomingMessage(message, no_ack=True))
 
-            if confirmation_type == ConfirmationTypes.ACK:
-                future.set_result(True)
-            elif confirmation_type == ConfirmationTypes.NACK:
-                future.set_exception(exceptions.NackError(method_frame))
-        except ValueError:
-            future.set_exception(
-                RuntimeError('Unknown method frame', method_frame)
-            )
-        except Exception as e:
-            future.set_exception(e)
+    async def declare_exchange(
+        self, name: str, type: Union[ExchangeType, str] = ExchangeType.DIRECT,
+        durable: bool = None, auto_delete: bool = False,
+        internal: bool = False, passive: bool = False, arguments: dict = None,
+        timeout: TimeoutType = None
+    ) -> Exchange:
+        """
+        Declare an exchange.
 
-    @BaseChannel._ensure_channel_is_open
-    async def declare_exchange(self, name: str,
-                               type: ExchangeType=ExchangeType.DIRECT,
-                               durable: bool=None, auto_delete: bool=False,
-                               internal: bool=False, passive: bool=False,
-                               arguments: dict=None,
-                               timeout: int=None) -> Exchange:
+        :param name: string with exchange name or
+            :class:`aio_pika.exchange.Exchange` instance
+        :param type: Exchange type. Enum ExchangeType value or string.
+            String values must be one of 'fanout', 'direct', 'topic',
+            'headers', 'x-delayed-message', 'x-consistent-hash'.
+        :param durable: Durability (exchange survive broker restart)
+        :param auto_delete: Delete queue when channel will be closed.
+        :param internal: Do not send it to broker just create an object
+        :param passive: Only check to see if the queue exists.
+        :param arguments: additional arguments
+        :param timeout: execution timeout
+        :return: :class:`aio_pika.exchange.Exchange` instance
+        """
 
-        async with self._write_lock:
-            if auto_delete and durable is None:
-                durable = False
+        if auto_delete and durable is None:
+            durable = False
 
-            exchange = self.EXCHANGE_CLASS(
-                self._channel, self._publish, name, type,
-                durable=durable, auto_delete=auto_delete, internal=internal,
-                passive=passive, arguments=arguments, loop=self.loop,
-                future_store=self._futures.get_child(),
-            )
+        exchange = self.EXCHANGE_CLASS(
+            connection=self._connection, channel=self.channel,
+            name=name, type=type, durable=durable, auto_delete=auto_delete,
+            internal=internal, passive=passive, arguments=arguments
+        )
 
-            await exchange.declare(timeout=timeout)
+        await exchange.declare(timeout=timeout)
 
-            log.debug("Exchange declared %r", exchange)
+        log.debug("Exchange declared %r", exchange)
 
-            return exchange
+        return exchange
 
-    @BaseChannel._ensure_channel_is_open
-    async def _publish(self, queue_name, routing_key, body,
-                       properties: BasicProperties, mandatory, immediate):
+    async def declare_queue(
+        self, name: str = None, *, durable: bool = None,
+        exclusive: bool = False, passive: bool = False,
+        auto_delete: bool = False, arguments: dict = None,
+        timeout: TimeoutType = None
+    ) -> Queue:
 
-        async with self._write_lock:
-            while self._connection.is_closed:
-                log.debug(
-                    "Can't publish message because connection is inactive"
-                )
-                await asyncio.sleep(1, loop=self.loop)
-
-            f = self._create_future()
-            self._delivery_tag += 1
-
-            if self._on_return_raises:
-                properties.headers = properties.headers or {}
-                properties.headers['delivery-tag'] = str(self._delivery_tag)
-
-            try:
-                self._channel.basic_publish(
-                    queue_name, routing_key, body,
-                    properties, mandatory, immediate
-                )
-            except (AttributeError, RuntimeError) as exc:
-                log.exception(
-                    "Failed to send data to client "
-                    "(connection unexpectedly closed)"
-                )
-                self._on_channel_close(self._channel, -1, exc)
-                self._connection._connection.close(
-                    reply_code=500, reply_text="Incorrect state"
-                )
-            else:
-                if self._publisher_confirms:
-                    self._confirmations[self._delivery_tag] = f
-                else:
-                    f.set_result(None)
-
-            return await f
-
-    @BaseChannel._ensure_channel_is_open
-    async def declare_queue(self, name: str=None, *, durable: bool=None,
-                            exclusive: bool=False, passive: bool=False,
-                            auto_delete: bool=False, arguments: dict=None,
-                            timeout: int=None) -> Queue:
         """
 
         :param name: queue name
@@ -293,95 +238,80 @@ class Channel(BaseChannel):
             be accessed by the current connection, and are deleted when that
             connection closes. Passive declaration of an exclusive queue by
             other connections are not allowed.
-        :param passive: Only check to see if the queue exists.
+        :param passive: Do not fail when entity was declared
+            previously but has another params.
         :param auto_delete: Delete queue when channel will be closed.
-        :param arguments: pika additional arguments
+        :param arguments: additional arguments
         :param timeout: execution timeout
         :return: :class:`aio_pika.queue.Queue` instance
         """
 
-        async with self._write_lock:
-            if auto_delete and durable is None:
-                durable = False
+        queue = self.QUEUE_CLASS(
+            connection=self,
+            channel=self.channel,
+            name=name,
+            durable=durable,
+            exclusive=exclusive,
+            auto_delete=auto_delete,
+            arguments=arguments,
+            passive=passive,
+        )
 
-            queue = self.QUEUE_CLASS(
-                self.loop, self._futures.get_child(), self._channel, name,
-                durable, exclusive, auto_delete, arguments
-            )
+        await queue.declare(timeout=timeout)
 
-            await queue.declare(timeout, passive=passive)
-            return queue
+        return queue
 
-    async def close(self) -> None:
-        if not self._channel:
-            log.warning("Channel already closed")
-            return
+    async def set_qos(
+        self, prefetch_count: int = 0, prefetch_size: int = 0,
+        all_channels: bool = False, timeout: TimeoutType = None
+    ) -> aiormq.spec.Basic.QosOk:
 
-        async with self._write_lock:
-            self._channel.close()
-            await self.closing
-            self._channel = None
-
-    @BaseChannel._ensure_channel_is_open
-    async def set_qos(self, prefetch_count: int=0, prefetch_size: int=0,
-                      all_channels=False, timeout: int=None):
-        async with self._write_lock:
-            f = self._create_future(timeout=timeout)
-
-            self._channel.basic_qos(
-                f.set_result,
+        return await asyncio.wait_for(
+            self.channel.basic_qos(
                 prefetch_count=prefetch_count,
-                prefetch_size=prefetch_size,
-                all_channels=all_channels
-            )
+                prefetch_size=prefetch_size
+            ),
+            timeout=timeout
+        )
 
-            return await f
+    async def queue_delete(
+        self, queue_name: str, timeout: TimeoutType = None,
+        if_unused: bool = False, if_empty: bool = False, nowait: bool = False
+    ) -> aiormq.spec.Queue.DeleteOk:
 
-    @BaseChannel._ensure_channel_is_open
-    async def queue_delete(self, queue_name: str, timeout: int=None,
-                           if_unused: bool=False, if_empty: bool=False,
-                           nowait: bool=False):
-
-        async with self._write_lock:
-            f = self._create_future(timeout=timeout)
-
-            self._channel.queue_delete(
-                callback=f.set_result,
+        return await asyncio.wait_for(
+            self.channel.queue_delete(
                 queue=queue_name,
                 if_unused=if_unused,
                 if_empty=if_empty,
-                nowait=nowait
-            )
+                nowait=nowait,
+            ),
+            timeout=timeout
+        )
 
-            return await f
+    async def exchange_delete(
+        self, exchange_name: str, timeout: TimeoutType = None,
+        if_unused: bool = False, nowait: bool = False
+    ) -> aiormq.spec.Exchange.DeleteOk:
 
-    @BaseChannel._ensure_channel_is_open
-    async def exchange_delete(self, exchange_name: str, timeout: int=None,
-                              if_unused=False, nowait=False):
-        async with self._write_lock:
-            f = self._create_future(timeout=timeout)
-
-            self._channel.exchange_delete(
-                callback=f.set_result, exchange=exchange_name,
-                if_unused=if_unused, nowait=nowait
-            )
-
-            return await f
+        return await asyncio.wait_for(
+            self.channel.exchange_delete(
+                exchange=exchange_name,
+                if_unused=if_unused,
+                nowait=nowait,
+            ),
+            timeout=timeout
+        )
 
     def transaction(self) -> Transaction:
         if self._publisher_confirms:
             raise RuntimeError("Cannot create transaction when publisher "
                                "confirms are enabled")
 
-        tx = Transaction(self._channel, self._futures.get_child())
+        return Transaction(self._channel)
 
-        self.add_close_callback(tx.on_close_callback)
-
-        tx.closing.add_done_callback(
-            lambda _: self.remove_close_callback(tx.on_close_callback)
-        )
-
-        return tx
+    async def flow(self, active: bool = True) -> aiormq.spec.Channel.FlowOk:
+        return await self.channel.flow(active=active)
 
 
-__all__ = ('Channel',)
+__all__ = ('Channel', 'ConfirmationTypes')

@@ -1,40 +1,57 @@
 import asyncio
+from enum import Enum
 
-from .common import FutureStore
-from .exceptions import TransactionClosed
+import aiormq
+
+
+class TransactionStates(Enum):
+    created = 'created'
+    commited = 'commited'
+    rolled_back = 'rolled back'
+    started = 'started'
 
 
 class Transaction:
-    def __init__(self, channel, future_store: FutureStore):
+    def __str__(self):
+        return self.state.value
+
+    def __init__(self, channel):
+        self.loop = channel.loop
         self._channel = channel
-        self._future_store = future_store
-        self.closing = self._future_store.create_future()
+        self.state = TransactionStates.created      # type: TransactionStates
 
-    def _create_future(self, timeout=None):
-        if self.closing.done():
-            raise RuntimeError("Can't reuse closed transaction")
+    @property
+    def channel(self) -> aiormq.Channel:
+        if self._channel is None:
+            raise RuntimeError("Channel not opened")
 
-        return self._future_store.create_future(timeout)
+        if self._channel.is_closed:
+            raise RuntimeError('Closed channel')
 
-    def select(self, timeout=None):
-        future = self._create_future(timeout)
-        self._channel.tx_select(future.set_result)
-        return future
+        return self._channel
 
-    def rollback(self, timeout=None):
-        future = self._create_future(timeout)
-        self._channel.tx_rollback(future.set_result)
-        return future
+    async def select(self, timeout=None) -> aiormq.spec.Tx.SelectOk:
+        result = await asyncio.wait_for(
+            self.channel.tx_select(), timeout=timeout
+        )
 
-    def commit(self, timeout=None):
-        future = self._create_future(timeout)
-        self._channel.tx_commit(future.set_result)
-        return future
+        self.state = TransactionStates.started
+        return result
 
-    def close(self, exc: Exception=TransactionClosed):
-        if not self.closing.done():
-            self.closing.set_result(None)
-        self._future_store.reject_all(exc)
+    async def rollback(self, timeout=None):
+        result = await asyncio.wait_for(
+            self.channel.tx_rollback(), timeout=timeout
+        )
+        self.state = TransactionStates.rolled_back
+        return result
+
+    async def commit(self, timeout=None):
+        result = await asyncio.wait_for(
+            self.channel.tx_commit(), timeout=timeout
+        )
+
+        self.state = TransactionStates.commited
+        return result
 
     async def __aenter__(self):
         result = await self.select()
@@ -45,14 +62,3 @@ class Transaction:
             await self.rollback()
         else:
             await self.commit()
-
-        self.close()
-
-    def __del__(self):
-        self.close(ReferenceError('Transaction deleted'))
-
-    def on_close_callback(self, result: asyncio.Future):
-        exc = result.exception()
-
-        if exc:
-            self.close(exc)

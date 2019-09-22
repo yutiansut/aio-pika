@@ -3,7 +3,7 @@ import aio_pika
 
 
 async def process_message(message: aio_pika.IncomingMessage):
-    with message.process():
+    async with message.process():
         print(message.body)
         await asyncio.sleep(1)
 
@@ -29,8 +29,14 @@ async def main(loop):
 
     await queue.consume(process_message)
 
+    return connection
+
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(main(loop))
-    loop.run_forever()
+    connection = loop.run_until_complete(main(loop))
+
+    try:
+        loop.run_forever()
+    finally:
+        loop.run_until_complete(connection.close())

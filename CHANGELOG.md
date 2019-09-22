@@ -1,3 +1,232 @@
+6.1.2
+-----
+* Added typing on process method #252
+
+6.1.1
+-----
+
+* Documentation fixes
+* Missed timeout parameter on `connect()` #245
+
+6.1.0
+-----
+
+* Unified `CallbackCollection`s for channels and connections
+* Make RobustConnection more robust
+* `JsonRPC` and `JsonMaster` adapters
+* Improve patterns documentation
+
+6.0.1
+-----
+
+* Extended ExchangeType #237. Added `x-modulus-hash` exchange type.
+
+6.0.0
+-----
+
+* `RobustConnection` logic changes (see #234). 
+  Thanks to @decaz for analysis and fixes. 
+
+5.6.3
+-----
+
+* add more type annotations
+* consistent setting headers for message #233
+
+5.6.2
+-----
+
+* Fixes: set header value on HeaderProxy #232
+
+5.5.3
+-----
+
+* Fixed #218. How to properly close RobustConnection?
+
+5.5.2
+-----
+
+* Fixed #216. Exception in Queue.consume callback isn't propagated properly.
+
+5.5.1
+-----
+
+* Allow to specify `requeue=` and `reject_on_redelivered=` in Master pattern #212
+
+
+5.5.0
+-----
+
+* Fixed #209 int values for headers
+
+5.4.1
+-----
+
+* update aiormq version
+* use `AMQPError` instead of `AMQPException`. `AMQPException` is now alias for `AMQPError`
+
+5.4.0
+-----
+
+* Fix routing key handling (#206 @decaz)
+* Fix URL building (#207 @decaz)
+* Test suite for `connect` function
+
+
+5.3.2
+-----
+
+* Fix tests for `Pool`
+
+
+5.3.1
+-----
+
+* no duplicate call message when exception
+* add robust classes to apidoc
+
+5.3.0
+-----
+
+* use None instead of Elipsis for initial state (@chibby0ne)
+* `Pool`: enable arguments for pool constructor (@chibby0ne)
+* Create py.typed (#176 @zarybnicky)
+* 
+
+5.2.4
+-----
+
+* Fix encode timestamp error on copy (#198 @tzoiker) 
+* Bump `aiormq`
+
+5.2.2
+-----
+
+* Fix HeaderProxy bug (#195 @tzoiker)
+
+5.2.1
+-----
+
+* remove non-initialized channels when reconnect
+
+5.2.0
+-----
+
+* robust connection close only when unclosed
+* `heartbeat_last` property
+
+5.1.1
+-----
+
+* Simple test suite for testing robust connection via tcp proxy
+
+5.0.1
+-----
+
+* robust connection initialization hotfix
+
+5.0.0
+-----
+
+* Connector is now `aiormq` and not `pika`
+* Remove vendored `pika`
+* Compatibility changes:
+    * **[HIGH]** Exceptions hierarchy completely changed:
+        * ``UnroutableError`` removed. Use ``DeliveryError`` instead.
+        * ``ConnectionRefusedError`` is now standard ``ConnectionError``
+        * Each error code has separate exception type.
+    * **[LOW]** ``Connection.close`` method requires exception instead 
+    of ``code`` ``reason`` pair or ``None``
+    * **[MEDIUM]** ``IncomingMessage.ack`` ``IncomingMessage.nack`` 
+    ``IncomingMessage.reject`` returns coroutines. Old usage compatible 
+    but event loop might throw warnings.
+    * **[HIGH]** ``Message.timestamp`` property is now ``datetime.datetime``
+    * **[LOW]** Tracking of ``publisher confirms`` removed, using 
+    similar feature from ``aiormq`` instead.
+    * **[LOW]** non async context manager ``IncomingMessage.process()`` 
+    is deprecated. Use ``async with message.process():`` instead.
+
+4.9.1
+-----
+
+* Fix race condition on callback timeout #180
+
+4.9.0
+-----
+
+* Add abstract pool #174
+* Fixed Deprecation Warnings in Python 3.7 #153
+
+
+4.8.1
+-----
+
+* Migrate from travis to drone.io
+* Use pylava instead of pylama
+
+4.8.0
+-----
+
+* save passive flag on reconnect #170
+
+4.7.0
+-----
+
+* fixed inconsistent argument type for connection.connect #136
+* fixed conditions for creating SSL connection. #135
+
+4.6.4
+-----
+
+* Fix UnboundLocalError exception #163 
+
+4.6.3
+-----
+
+* RobustConnection fixes #162
+* Fix code examples in the README.rst
+
+4.6.1
+-----
+
+* Close connection in examples
+
+4.6.0
+-----
+
+* Add content_type for all patterns
+
+4.5.0
+-----
+
+* Add special exceptions for Worker
+
+4.4.0
+-----
+
+* More extendable Master
+
+4.3.0
+-----
+
+* Fix #112
+* Fix #155
+
+4.2.0
+-----
+
+* Add default params for RPC.cereate()
+
+4.1.0
+-----
+
+* Fix InvalidStateError when connection lost
+
+4.0.1
+-----
+
+* Fix: RPC stuck when response deserialization error
+
 4.0.0
 -----
 

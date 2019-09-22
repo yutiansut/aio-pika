@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 
 from functools import partial
@@ -14,6 +15,20 @@ from .base import Proxy, Base
 
 
 log = logging.getLogger(__name__)
+
+
+class MessageProcessingError(Exception):
+    pass
+
+
+class NackMessage(MessageProcessingError):
+    def __init__(self, requeue=False):
+        self.requeue = requeue
+
+
+class RejectMessage(MessageProcessingError):
+    def __init__(self, requeue=False):
+        self.requeue = requeue
 
 
 class Worker:
@@ -38,7 +53,6 @@ class Worker:
 class Master(Base):
     __slots__ = 'channel', 'loop', 'proxy',
 
-    CONTENT_TYPE = 'application/python-pickle'
     DELIVERY_MODE = DeliveryMode.PERSISTENT
 
     __doc__ = """
@@ -56,7 +70,11 @@ class Master(Base):
         await master.proxy.test_worker('foo')
     """
 
-    def __init__(self, channel: Channel):
+    def __init__(
+            self, channel: Channel,
+            requeue: bool = True,
+            reject_on_redelivered: bool = False
+    ):
         """ Creates a new :class:`Master` instance.
 
         :param channel: Initialized instance of :class:`aio_pika.Channel`
@@ -64,7 +82,15 @@ class Master(Base):
         self.channel = channel          # type: Channel
         self.loop = self.channel.loop   # type: asyncio.AbstractEventLoop
         self.proxy = Proxy(self.create_task)
+
         self.channel.add_on_return_callback(self.on_message_returned)
+
+        self._requeue = requeue
+        self._reject_on_redelivered = reject_on_redelivered
+
+    @property
+    def exchange(self):
+        return self.channel.default_exchange
 
     def on_message_returned(self, message: ReturnedMessage):
         log.warning(
@@ -95,29 +121,41 @@ class Master(Base):
     @classmethod
     async def execute(cls, func, kwargs):
         kwargs = kwargs or {}
-        result = await func(**kwargs)
-        return result
+
+        if not isinstance(kwargs, dict):
+            raise RejectMessage(requeue=False)
+
+        return await func(**kwargs)
 
     async def on_message(self, func, message: IncomingMessage):
-        with message.process(requeue=True, ignore_processed=True):
+        async with message.process(
+                requeue=self._requeue,
+                reject_on_redelivered=self._reject_on_redelivered,
+                ignore_processed=True
+        ):
             data = self.deserialize(message.body)
-            await self.execute(func, data)
+
+            try:
+                await self.execute(func, data)
+            except RejectMessage as e:
+                message.reject(requeue=e.requeue)
+            except NackMessage as e:
+                message.nack(requeue=e.requeue)
+
+    async def create_queue(self, channel_name, **kwargs) -> Queue:
+        return await self.channel.declare_queue(channel_name, **kwargs)
 
     async def create_worker(self, channel_name: str,
                             func: Callable, **kwargs) -> Worker:
         """ Creates a new :class:`Worker` instance. """
-        queue = await self.channel.declare_queue(channel_name, **kwargs)
+
+        queue = await self.create_queue(channel_name, **kwargs)
 
         if hasattr(func, "_is_coroutine"):
             fn = func
         else:
             fn = asyncio.coroutine(func)
-        consumer_tag = await queue.consume(
-            partial(
-                self.on_message,
-                fn
-            )
-        )
+        consumer_tag = await queue.consume(partial(self.on_message, fn))
 
         return Worker(queue, consumer_tag, self.loop)
 
@@ -132,6 +170,14 @@ class Master(Base):
             **message_kwargs
         )
 
-        await self.channel.default_exchange.publish(
+        await self.exchange.publish(
             message, channel_name, mandatory=True
         )
+
+
+class JsonMaster(Master):
+    SERIALIZER = json
+    CONTENT_TYPE = 'application/json'
+
+    def serialize(self, data: Any) -> bytes:
+        return self.SERIALIZER.dumps(data, ensure_ascii=False)

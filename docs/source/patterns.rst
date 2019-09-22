@@ -1,4 +1,4 @@
-.. _aio_pika: https://github.com/mosquito/aio-pika
+.. _aio-pika: https://github.com/mosquito/aio-pika
 
 
 Patterns and helpers
@@ -6,7 +6,7 @@ Patterns and helpers
 
 .. note:: Available since `aio-pika>=1.7.0`
 
-`aio_pika`_ includes some useful patterns for creating distributed systems.
+`aio-pika`_ includes some useful patterns for creating distributed systems.
 
 
 .. _patterns-worker:
@@ -48,4 +48,17 @@ The caller creates tasks and awaiting results:
 One or multimple callees executing tasks:
 
 .. literalinclude:: examples/rpc-callee.py
+   :language: python
+
+Extending
+~~~~~~~~~
+
+Both patterns serialization behaviour might be changed by inheritance and
+redefinition of methods :func:`aio_pika.patterns.base.serialize`
+and :func:`aio_pika.patterns.base.deserialize`.
+
+
+Following examples demonstrates it:
+
+.. literalinclude:: examples/extend-patterns.py
    :language: python

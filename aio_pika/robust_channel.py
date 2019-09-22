@@ -1,23 +1,21 @@
-import asyncio
-from typing import Callable, Any, Union, Awaitable
+import aiormq
+
+try:  # pragma: no cover
+    from typing import Awaitable  # noqa
+except ImportError:
+    from typing_extensions import Awaitable  # noqa
 
 from logging import getLogger
 
 from .exchange import Exchange, ExchangeType
-from .message import IncomingMessage
 from .queue import Queue
-from .common import BaseChannel, FutureStore
+from .types import TimeoutType
 from .channel import Channel
 from .robust_queue import RobustQueue
 from .robust_exchange import RobustExchange
 
 
 log = getLogger(__name__)
-
-FunctionOrCoroutine = Union[
-    Callable[[IncomingMessage], Any],
-    Awaitable[IncomingMessage]
-]
 
 
 class RobustChannel(Channel):
@@ -26,9 +24,8 @@ class RobustChannel(Channel):
     QUEUE_CLASS = RobustQueue
     EXCHANGE_CLASS = RobustExchange
 
-    def __init__(self, connection, loop: asyncio.AbstractEventLoop,
-                 future_store: FutureStore, channel_number: int=None,
-                 publisher_confirms: bool=True, on_return_raises=False):
+    def __init__(self, connection, channel_number: int = None,
+                 publisher_confirms: bool = True, on_return_raises=False):
         """
 
         :param connection: :class:`aio_pika.adapter.AsyncioConnection` instance
@@ -40,8 +37,6 @@ class RobustChannel(Channel):
             (in pursuit of performance)
         """
         super().__init__(
-            loop=loop,
-            future_store=future_store.get_child(),
             connection=connection,
             channel_number=channel_number,
             publisher_confirms=publisher_confirms,
@@ -54,16 +49,10 @@ class RobustChannel(Channel):
         self._qos = 0, 0
 
     async def on_reconnect(self, connection, channel_number):
-        exc = ConnectionError('Auto Reconnect Error')
-
-        if not self._closing.done():
-            self._closing.set_exception(exc)
-
-        self._closing = self.loop.create_future()
-        self._futures.reject_all(exc)
         self._connection = connection
         self._channel_number = channel_number
 
+        self._channel = None
         await self.initialize()
 
         for exchange in self._exchanges.values():
@@ -72,7 +61,7 @@ class RobustChannel(Channel):
         for queue in self._queues.values():
             await queue.on_reconnect(self)
 
-    async def initialize(self, timeout=None):
+    async def initialize(self, timeout: TimeoutType = None):
         result = await super().initialize()
 
         prefetch_count, prefetch_size = self._qos
@@ -84,8 +73,9 @@ class RobustChannel(Channel):
 
         return result
 
-    async def set_qos(self, prefetch_count: int=0, prefetch_size: int=0,
-                      all_channels=False, timeout: int=None):
+    async def set_qos(self, prefetch_count: int = 0, prefetch_size: int = 0,
+                      all_channels=False, timeout: TimeoutType = None):
+
         if all_channels:
             raise NotImplementedError("Not available to RobustConnection")
 
@@ -97,23 +87,13 @@ class RobustChannel(Channel):
             timeout=timeout,
         )
 
-    @BaseChannel._ensure_channel_is_open
-    async def close(self) -> None:
-        if self._closed:
-            return
-
-        async with self._write_lock:
-            self._closed = True
-            self._channel.close()
-            await self.closing
-            self._channel = None
-
     async def declare_exchange(self, name: str,
-                               type: ExchangeType=ExchangeType.DIRECT,
-                               durable: bool=None, auto_delete: bool=False,
-                               internal: bool=False, passive: bool=False,
-                               arguments: dict=None, timeout: int=None,
-                               robust: bool=True) -> Exchange:
+                               type: ExchangeType = ExchangeType.DIRECT,
+                               durable: bool = None, auto_delete: bool = False,
+                               internal: bool = False, passive: bool = False,
+                               arguments: dict = None,
+                               timeout: TimeoutType = None,
+                               robust: bool = True) -> Exchange:
 
         exchange = await super().declare_exchange(
             name=name, type=type, durable=durable, auto_delete=auto_delete,
@@ -126,8 +106,10 @@ class RobustChannel(Channel):
 
         return exchange
 
-    async def exchange_delete(self, exchange_name: str, timeout: int=None,
-                              if_unused=False, nowait=False):
+    async def exchange_delete(self, exchange_name: str,
+                              timeout: TimeoutType = None, if_unused=False,
+                              nowait=False) -> aiormq.spec.Exchange.DeleteOk:
+
         result = await super().exchange_delete(
             exchange_name=exchange_name, timeout=timeout,
             if_unused=if_unused, nowait=nowait
@@ -137,11 +119,11 @@ class RobustChannel(Channel):
 
         return result
 
-    async def declare_queue(self, name: str=None, *, durable: bool=None,
-                            exclusive: bool=False,
-                            passive: bool=False, auto_delete: bool=False,
-                            arguments: dict=None, timeout: int=None,
-                            robust: bool=True) -> Queue:
+    async def declare_queue(self, name: str = None, *, durable: bool = None,
+                            exclusive: bool = False, passive: bool = False,
+                            auto_delete: bool = False, arguments: dict = None,
+                            timeout: TimeoutType = None,
+                            robust: bool = True) -> Queue:
 
         queue = await super().declare_queue(
             name=name, durable=durable, exclusive=exclusive,
@@ -154,9 +136,9 @@ class RobustChannel(Channel):
 
         return queue
 
-    async def queue_delete(self, queue_name: str, timeout: int=None,
-                           if_unused: bool=False, if_empty: bool=False,
-                           nowait: bool=False):
+    async def queue_delete(self, queue_name: str, timeout: TimeoutType = None,
+                           if_unused: bool = False, if_empty: bool = False,
+                           nowait: bool = False):
         result = await super().queue_delete(
             queue_name=queue_name, timeout=timeout,
             if_unused=if_unused, if_empty=if_empty, nowait=nowait

@@ -1,12 +1,18 @@
 import asyncio
-from functools import partial, wraps
+import logging
+from functools import wraps
+from collections.abc import Set
+from threading import Lock
+from typing import Callable, Iterable
 
-__all__ = 'wait', 'create_task', 'iscoroutinepartial'
+__all__ = 'create_task', 'iscoroutinepartial', 'shield', 'CallbackCollection',
+
+log = logging.getLogger(__name__)
 
 
 def iscoroutinepartial(fn):
     """
-    Function returns True if function it's a partial instance of coroutine.
+    Function returns True if function is a partial instance of coroutine.
     See additional information here_.
 
     :param fn: Function
@@ -27,58 +33,119 @@ def iscoroutinepartial(fn):
     return asyncio.iscoroutinefunction(parent)
 
 
-def create_task(*, loop=None):
-    """ Helper for `create a new Task`_ with backward compatibility
-    for Python 3.4
-
-    .. _create a new Task: https://goo.gl/g4pMV9
-    """
-
+def create_task(func, *args, loop=None, **kwargs):
     loop = loop or asyncio.get_event_loop()
 
-    try:
-        return loop.create_task
-    except AttributeError:
-        return partial(asyncio.ensure_future, loop=loop)
+    if iscoroutinepartial(func):
+        return loop.create_task(func(*args, **kwargs))
+
+    def run(future):
+        if future.done():
+            return
+
+        try:
+            future.set_result(func(*args, **kwargs))
+        except Exception as e:
+            future.set_exception(e)
+
+        return future
+
+    future = loop.create_future()
+    loop.call_soon(run, future)
+    return future
 
 
-async def wait(tasks, loop=None):
-    """
-    Simple helper for gathering all passed :class:`Task`s.
-
-    :param tasks: list of the :class:`asyncio.Task`s
-    :param loop:
-        Event loop (:func:`asyncio.get_event_loop()` when :class:`None`)
-    :return: :class:`tuple` of results
-    """
-
-    loop = loop or asyncio.get_event_loop()
-    done = await asyncio.gather(*list(tasks), loop=loop)
-    return tuple(
-        map(
-            lambda x: x.result() if isinstance(x, asyncio.Future) else x, done
-        )
-    )
-
-
-def shield(func, loop=None):
+def shield(func):
     """
     Simple and useful decorator for wrap the coroutine to `asyncio.shield`.
     """
-
-    if isinstance(func, asyncio.AbstractEventLoop):
-        return partial(shield, loop=func)
 
     async def awaiter(future):
         return await future
 
     @wraps(func)
     def wrap(*args, **kwargs):
-        return awaiter(
-            asyncio.shield(
-                func(*args, **kwargs),
-                loop=loop or asyncio.get_event_loop()
-            )
-        )
+        return wraps(func)(awaiter)(asyncio.shield(func(*args, **kwargs)))
 
     return wrap
+
+
+class CallbackCollection(Set):
+    __slots__ = '__callbacks', '__lock'
+
+    def __init__(self):
+        self.__callbacks = set()
+        self.__lock = Lock()
+
+    def add(self, callback: Callable):
+        if self.is_frozen:
+            raise RuntimeError('Collection frozen')
+        if not callable(callback):
+            raise ValueError("Callback is not callable")
+
+        with self.__lock:
+            self.__callbacks.add(callback)
+
+    def remove(self, callback: Callable):
+        if self.is_frozen:
+            raise RuntimeError('Collection frozen')
+
+        with self.__lock:
+            self.__callbacks.remove(callback)
+
+    def clear(self):
+        if self.is_frozen:
+            raise RuntimeError('Collection frozen')
+
+        with self.__lock:
+            self.__callbacks.clear()
+
+    @property
+    def is_frozen(self) -> bool:
+        return isinstance(self.__callbacks, frozenset)
+
+    def freeze(self):
+        if self.is_frozen:
+            raise RuntimeError("Collection already frozen")
+
+        with self.__lock:
+            self.__callbacks = frozenset(self.__callbacks)
+
+    def unfreeze(self):
+        if not self.is_frozen:
+            raise RuntimeError("Collection is not frozen")
+
+        with self.__lock:
+            self.__callbacks = set(self.__callbacks)
+
+    def __contains__(self, x: object) -> bool:
+        return x in self.__callbacks
+
+    def __len__(self) -> int:
+        return len(self.__callbacks)
+
+    def __iter__(self) -> Iterable[Callable]:
+        return iter(self.__callbacks)
+
+    def __bool__(self):
+        return bool(self.__callbacks)
+
+    def __copy__(self):
+        instance = self.__class__()
+
+        with self.__lock:
+            for cb in self.__callbacks:
+                instance.add(cb)
+
+        if self.is_frozen:
+            instance.freeze()
+
+        return instance
+
+    def __call__(self, *args, **kwargs):
+        with self.__lock:
+            for cb in self.__callbacks:
+                try:
+                    cb(*args, **kwargs)
+                except Exception:
+                    log.exception('Callback error')

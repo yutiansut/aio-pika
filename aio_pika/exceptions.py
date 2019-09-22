@@ -1,49 +1,41 @@
-from aio_pika.pika.exceptions import (
+import asyncio
+
+import pamqp
+from aiormq.exceptions import (
     AMQPChannelError,
     AMQPConnectionError,
     AMQPError,
+    AMQPException,
     AuthenticationError,
-    BodyTooLongError,
     ChannelClosed,
-    ChannelError,
     ConnectionClosed,
-    ConsumerCancelled,
+    DeliveryError,
     DuplicateConsumerTag,
     IncompatibleProtocolError,
-    InvalidChannelNumber,
-    InvalidFieldTypeException,
     InvalidFrameError,
-    InvalidMaximumFrameSize,
-    InvalidMinimumFrameSize,
     MethodNotImplemented,
-    NackError,
-    NoFreeChannels,
-    ProbableAccessDeniedError,
     ProbableAuthenticationError,
     ProtocolSyntaxError,
-    ProtocolVersionMismatch,
-    RecursionError,
-    ShortStringTooLong,
-    UnexpectedFrameError,
-    UnroutableError,
-    UnspportedAMQPFieldException,
-    UnsupportedAMQPFieldException,
+    ChannelPreconditionFailed,
+    ChannelNotFoundEntity
 )
 
+PAMQP_EXCEPTIONS = (
+    pamqp.exceptions.PAMQPException,
+) + tuple(pamqp.specification.ERRORS.values())
 
-class AMQPException(Exception):
+CONNECTION_EXCEPTIONS = (
+    RuntimeError,
+    ConnectionError,
+    AMQPError,
+) + PAMQP_EXCEPTIONS
+
+
+class MessageProcessError(AMQPError):
     pass
 
 
-class MessageProcessError(AMQPException):
-    pass
-
-
-class QueueEmpty(AMQPException):
-    pass
-
-
-class TransactionClosed(AMQPException):
+class QueueEmpty(AMQPError, asyncio.QueueEmpty):
     pass
 
 
@@ -53,32 +45,17 @@ __all__ = (
     'AMQPError',
     'AMQPException',
     'AuthenticationError',
-    'BodyTooLongError',
     'ChannelClosed',
-    'ChannelError',
     'ConnectionClosed',
-    'ConsumerCancelled',
+    'DeliveryError',
     'DuplicateConsumerTag',
     'IncompatibleProtocolError',
-    'InvalidChannelNumber',
-    'InvalidFieldTypeException',
     'InvalidFrameError',
-    'InvalidMaximumFrameSize',
-    'InvalidMinimumFrameSize',
     'MessageProcessError',
     'MethodNotImplemented',
-    'NackError',
-    'NoFreeChannels',
-    'ProbableAccessDeniedError',
     'ProbableAuthenticationError',
     'ProtocolSyntaxError',
-    'ProtocolVersionMismatch',
     'QueueEmpty',
-    'RecursionError',
-    'ShortStringTooLong',
-    'TransactionClosed',
-    'UnexpectedFrameError',
-    'UnroutableError',
-    'UnspportedAMQPFieldException',
-    'UnsupportedAMQPFieldException',
+    'ChannelPreconditionFailed',
+    'ChannelNotFoundEntity',
 )

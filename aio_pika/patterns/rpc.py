@@ -1,17 +1,20 @@
 import asyncio
+import json
 import logging
 import pickle
 
 import time
+from enum import Enum
 from functools import partial
 from typing import Callable, Any, TypeVar
 
 from aio_pika.exchange import ExchangeType
 from aio_pika.channel import Channel
-from aio_pika.exceptions import UnroutableError
+from aio_pika.exceptions import DeliveryError
 from aio_pika.message import (
     Message, IncomingMessage, DeliveryMode, ReturnedMessage
 )
+from aio_pika.tools import shield
 from .base import Proxy, Base
 
 log = logging.getLogger(__name__)
@@ -19,6 +22,12 @@ log = logging.getLogger(__name__)
 R = TypeVar('R')
 P = TypeVar('P')
 CallbackType = Callable[[P], R]
+
+
+class RPCMessageTypes(Enum):
+    error = 'error'
+    result = 'result'
+    call = 'call'
 
 
 class RPC(Base):
@@ -66,44 +75,56 @@ class RPC(Base):
         self.consumer_tags = {}
         self.dlx_exchange = None
 
+    def __remove_future(self, future: asyncio.Future):
+        log.debug("Remove done future %r", future)
+        self.futures.pop(id(future), None)
+
     def create_future(self) -> asyncio.Future:
         future = self.loop.create_future()
-        future_id = id(future)
-        self.futures[future_id] = future
-        future.add_done_callback(lambda f: self.futures.pop(future_id, None))
+        log.debug("Create future for RPC call")
+
+        self.futures[id(future)] = future
+        future.add_done_callback(self.__remove_future)
         return future
 
-    def close(self) -> asyncio.Task:
-        async def closer():
-            nonlocal self
+    @shield
+    async def close(self):
+        if self.result_queue is None:
+            log.warning('RPC already closed')
+            return
 
-            if self.result_queue is None:
-                return
+        log.debug("Cancelling listening %r", self.result_queue)
+        await self.result_queue.cancel(self.result_consumer_tag)
+        self.result_consumer_tag = None
 
-            for future in self.futures.values():
-                future.set_exception(asyncio.CancelledError)
+        log.debug("Unbinding %r", self.result_queue)
+        await self.result_queue.unbind(
+            self.dlx_exchange, "",
+            arguments={
+                "From": self.result_queue.name,
+                'x-match': 'any',
+            }
+        )
 
-            await self.result_queue.unbind(
-                self.dlx_exchange, "",
-                arguments={
-                    "From": self.result_queue.name,
-                    'x-match': 'any',
-                }
-            )
+        log.debug("Cancelling undone futures %r", self.futures)
+        for future in self.futures.values():
+            if future.done():
+                continue
 
-            await self.result_queue.cancel(self.result_consumer_tag)
-            self.result_consumer_tag = None
+            future.set_exception(asyncio.CancelledError)
 
-            await self.result_queue.delete()
-            self.result_queue = None
+        log.debug("Deleting %r", self.result_queue)
+        await self.result_queue.delete()
+        self.result_queue = None
 
-        return self.loop.create_task(closer())
-
-    async def initialize(self, **kwargs):
+    @shield
+    async def initialize(self, auto_delete=True, durable=False, **kwargs):
         if self.result_queue is not None:
             return
 
-        self.result_queue = await self.channel.declare_queue(None, **kwargs)
+        self.result_queue = await self.channel.declare_queue(
+            None, auto_delete=auto_delete, durable=durable, **kwargs
+        )
 
         self.dlx_exchange = await self.channel.declare_exchange(
             self.DLX_NAME,
@@ -123,7 +144,16 @@ class RPC(Base):
             self.on_result_message, exclusive=True, no_ack=True
         )
 
+        self.channel.add_close_callback(self.on_close)
         self.channel.add_on_return_callback(self.on_message_returned)
+
+    def on_close(self, exc=None):
+        log.debug("Closing RPC futures because %r", exc)
+        for future in self.futures.values():
+            if future.done():
+                continue
+
+            future.set_exception(exc or Exception)
 
     @classmethod
     async def create(cls, channel: Channel, **kwargs) -> "RPC":
@@ -150,7 +180,7 @@ class RPC(Base):
             log.warning("Unknown message was returned: %r", message)
             return
 
-        future.set_exception(UnroutableError([message]))
+        future.set_exception(DeliveryError(message, None))
 
     async def on_result_message(self, message: IncomingMessage):
         correlation_id = int(
@@ -163,13 +193,18 @@ class RPC(Base):
             log.warning("Unknown message: %r", message)
             return
 
-        payload = self.deserialize(message.body)
+        try:
+            payload = self.deserialize(message.body)
+        except Exception as e:
+            log.error("Failed to deserialize response on message: %r", message)
+            future.set_exception(e)
+            return
 
-        if message.type == 'result':
+        if message.type == RPCMessageTypes.result.value:
             future.set_result(payload)
-        elif message.type == 'error':
+        elif message.type == RPCMessageTypes.error.value:
             future.set_exception(payload)
-        elif message.type == 'call':
+        elif message.type == RPCMessageTypes.call.value:
             future.set_exception(
                 asyncio.TimeoutError("Message timed-out", message)
             )
@@ -189,26 +224,44 @@ class RPC(Base):
 
             result = await self.execute(func, payload)
             result = self.serialize(result)
-            message_type = 'result'
+            message_type = RPCMessageTypes.result.value
         except Exception as e:
             result = self.serialize_exception(e)
-            message_type = 'error'
+            message_type = RPCMessageTypes.error.value
+
+        if not message.reply_to:
+            log.info(
+                'RPC message without "reply_to" header %r call result '
+                'will be lost', message
+            )
+            await message.ack()
+            return
 
         result_message = Message(
             result,
-            delivery_mode=message.delivery_mode,
+            content_type=self.CONTENT_TYPE,
             correlation_id=message.correlation_id,
+            delivery_mode=message.delivery_mode,
             timestamp=time.time(),
             type=message_type,
         )
 
-        await self.channel.default_exchange.publish(
-            result_message,
-            message.reply_to,
-            mandatory=False
-        )
+        try:
+            await self.channel.default_exchange.publish(
+                result_message,
+                message.reply_to,
+                mandatory=False
+            )
+        except Exception:
+            log.exception("Failed to send reply %r", result_message)
+            await message.reject(requeue=False)
+            return
 
-        message.ack()
+        if message_type == RPCMessageTypes.error.value:
+            await message.ack()
+            return
+
+        await message.ack()
 
     def serialize(self, data: Any) -> bytes:
         """ Serialize data to the bytes.
@@ -243,7 +296,7 @@ class RPC(Base):
         return await func(**payload)
 
     async def call(self, method_name, kwargs: dict=None, *,
-                   expiration: int=None, priority: int=128,
+                   expiration: int=None, priority: int=5,
                    delivery_mode: DeliveryMode=DELIVERY_MODE):
 
         """ Call remote method and awaiting result.
@@ -264,7 +317,7 @@ class RPC(Base):
 
         message = Message(
             body=self.serialize(kwargs or {}),
-            type='call',
+            type=RPCMessageTypes.call.value,
             timestamp=time.time(),
             priority=priority,
             correlation_id=id(future),
@@ -278,10 +331,12 @@ class RPC(Base):
         if expiration is not None:
             message.expiration = expiration
 
+        log.debug("Publishing calls for %s(%r)", method_name, kwargs)
         await self.channel.default_exchange.publish(
             message, routing_key=method_name, mandatory=True
         )
 
+        log.debug("Waiting RPC result for %s(%r)", method_name, kwargs)
         return await future
 
     async def register(self, method_name, func: CallbackType, **kwargs):
@@ -334,3 +389,20 @@ class RPC(Base):
         await queue.cancel(consumer_tag)
 
         self.routes.pop(queue.name)
+
+
+class JsonRPC(RPC):
+    SERIALIZER = json
+    CONTENT_TYPE = 'application/json'
+
+    def serialize(self, data: Any) -> bytes:
+        return self.SERIALIZER.dumps(data, ensure_ascii=False, default=repr)
+
+    def serialize_exception(self, exception: Exception) -> bytes:
+        return self.serialize({
+            "error": {
+                "type": exception.__class__.__name__,
+                "message": repr(exception),
+                "args": exception.args,
+            }
+        })
